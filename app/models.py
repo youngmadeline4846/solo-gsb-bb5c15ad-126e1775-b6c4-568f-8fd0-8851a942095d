@@ -215,6 +215,53 @@ class SubmissionRecord(BaseModel):
     created_at: str
 
 
+# ------------------------------------------------------------ 参考字混淆审计
+
+class ConfusionDirection(BaseModel):
+    """字符对审计的一个方向（source 作参考字、target 轨迹作书写）。"""
+
+    source_character: str
+    target_character: str
+    score: float = Field(ge=0.0, le=100.0, description="该方向的置信度 0-100")
+    reference_stroke_count: int
+    candidate_stroke_count: int = Field(description="充当书写的参考字笔画数")
+    matched_stroke_count: int
+    penalties: CandidatePenalties = Field(
+        description="该方向的缺笔/多笔惩罚：source 少笔记多笔、多笔记缺笔",
+    )
+
+
+class ConfusionPair(BaseModel):
+    """一对不同参考字的无序混淆结果。"""
+
+    character_a: str = Field(description="字符对中字典序较小的字符")
+    character_b: str = Field(description="字符对中字典序较大的字符")
+    score: float = Field(
+        ge=0.0, le=100.0,
+        description="双向相似度 min(A→B, B→A)，避免缺笔字被单向高估",
+    )
+    a_to_b: ConfusionDirection
+    b_to_a: ConfusionDirection
+
+
+class ConfusionAuditResponse(BaseModel):
+    """参考字两两混淆审计结果。"""
+
+    threshold: float = Field(ge=0.0, le=100.0, description="生效的相似度阈值")
+    limit: int = Field(description="返回字符对数上限（排序后截断）")
+    total_references: int = Field(description="参与审计的参考字数量")
+    total_comparisons: int = Field(
+        ge=0, description="无序字符对比较总数 n·(n−1)/2",
+    )
+    total_hits: int = Field(
+        ge=0,
+        description="相似度达到阈值的字符对总数（limit 截断前）",
+    )
+    pairs: list[ConfusionPair] = Field(
+        description="按 score 降序；同分按 (character_a, character_b) 字典序",
+    )
+
+
 # ------------------------------------------------------------ 练习质量趋势
 
 class PracticeAnalyticsFilter(BaseModel):

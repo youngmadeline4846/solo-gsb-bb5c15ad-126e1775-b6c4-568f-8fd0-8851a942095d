@@ -79,6 +79,55 @@ def _hungarian(cost: list[list[float]]) -> tuple[list[int], float]:
     return assignment, total
 
 
+# ------------------------------------------------------------------ 参考字混淆审计
+
+def _direction_summary(source: str, target: str, result: dict) -> dict:
+    """把一次 recognize_against 结果裁剪为字符对审计的单向视图。"""
+    return {
+        "source_character": source,
+        "target_character": target,
+        "score": result["score"],
+        "reference_stroke_count": result["reference_stroke_count"],
+        "candidate_stroke_count": result["user_stroke_count"],
+        "matched_stroke_count": result["matched_stroke_count"],
+        "penalties": result["penalties"],
+    }
+
+
+def compare_reference_pair(
+    character_a: str,
+    strokes_a: list[list[tuple[float, float]]],
+    character_b: str,
+    strokes_b: list[list[tuple[float, float]]],
+) -> dict:
+    """两个不同参考字之间的双向无序混淆比对，返回字符对结果字典。
+
+    两个方向各跑一次 recognize_against：A→B 以 A 为参考字、B 的轨迹充当
+    书写；B→A 反之。归一化基准与分叉容差都以参考字为准，因此两个方向的
+    分数不保证相等——少笔一侧作参考时（如“一”参考、“十”书写），缺笔
+    惩罚按 max(笔数) 归一后占比偏小，分数可能被单向高估。
+
+    字符对相似度取 min(score_ab, score_ba)，低分方向代表更严苛的解释，
+    从而避免缺笔/多笔字被单向上误判为高度相似。字符按字典序归范为
+    (character_a, character_b)，结果与输入次序无关。
+    """
+    if character_a == character_b:
+        raise ValueError("混淆审计只比较不同字符的参考轨迹")
+    if character_a > character_b:
+        character_a, character_b = character_b, character_a
+        strokes_a, strokes_b = strokes_b, strokes_a
+
+    ab = recognize_against(character_a, strokes_a, strokes_b)
+    ba = recognize_against(character_b, strokes_b, strokes_a)
+    return {
+        "character_a": character_a,
+        "character_b": character_b,
+        "score": min(ab["score"], ba["score"]),
+        "a_to_b": _direction_summary(character_a, character_b, ab),
+        "b_to_a": _direction_summary(character_b, character_a, ba),
+    }
+
+
 # ------------------------------------------------------------------ 单字匹配
 
 def _pair_cost_metrics(

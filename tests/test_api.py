@@ -395,6 +395,217 @@ def test_recognize_tie_break_is_stable(client):
     assert tied == ["乙", "十"]
 
 
+# ------------------------------------------------------------------ 参考字混淆审计
+
+# “一”：单横
+# “二”：短横 + 长横（见候选字识别夹具）
+# “十”：横 + 竖（见顶部 REF_SHI）
+# “口”：两笔折画围成方框（笔画数与“十”相同但形状迥异）
+REF_KOU = [
+    [[130.0, 130.0], [270.0, 130.0], [270.0, 270.0]],
+    [[270.0, 270.0], [130.0, 270.0], [130.0, 130.0]],
+]
+# “乙”夹具：横折“┐”（单笔复合笔画）
+REF_YI_ZHE = [[[100.0, 150.0], [300.0, 150.0], [300.0, 300.0]]]
+
+
+def _register_confusion_fixtures(client):
+    client.put("/v1/references/一", json={"character": "一", "strokes": REF_YI})
+    client.put("/v1/references/二", json={"character": "二", "strokes": REF_ER})
+    client.put("/v1/references/十", json={"character": "十", "strokes": REF_SHI})
+
+
+def test_confusions_empty_library(client):
+    r = client.get("/v1/references/confusions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["threshold"] == 0.0
+    assert body["limit"] == 100
+    assert body["total_references"] == 0
+    assert body["total_comparisons"] == 0
+    assert body["total_hits"] == 0
+    assert body["pairs"] == []
+
+
+def test_confusions_single_reference(client):
+    client.put("/v1/references/十", json={"character": "十", "strokes": REF_SHI})
+    body = client.get("/v1/references/confusions").json()
+    assert body["total_references"] == 1
+    assert body["total_comparisons"] == 0
+    assert body["total_hits"] == 0
+    assert body["pairs"] == []
+
+
+def test_confusions_pairwise_totals_and_directional_penalties(client):
+    _register_confusion_fixtures(client)
+    body = client.get("/v1/references/confusions", params={"threshold": 0}).json()
+    assert body["total_references"] == 3
+    assert body["total_comparisons"] == 3  # n·(n−1)/2
+    assert body["total_hits"] == 3
+
+    # 排序：相似度降序，同分按字符对字典序
+    scores = [p["score"] for p in body["pairs"]]
+    assert scores == sorted(scores, reverse=True)
+    names = [(p["character_a"], p["character_b"]) for p in body["pairs"]]
+    assert names == [("一", "十"), ("一", "二"), ("二", "十")]
+
+    top = body["pairs"][0]
+    assert top["score"] == 50.0
+    # A→B：以“一”为参考，“十”多一笔
+    ab = top["a_to_b"]
+    assert ab["source_character"] == "一" and ab["target_character"] == "十"
+    assert ab["reference_stroke_count"] == 1
+    assert ab["candidate_stroke_count"] == 2
+    assert ab["matched_stroke_count"] == 1
+    assert ab["score"] == 50.0
+    assert ab["penalties"]["missing_count"] == 0
+    assert ab["penalties"]["extra_count"] == 1
+    assert ab["penalties"]["extra_stroke_indices"] == [1]
+    # B→A：以“十”为参考，“一”缺一笔
+    ba = top["b_to_a"]
+    assert ba["source_character"] == "十" and ba["target_character"] == "一"
+    assert ba["reference_stroke_count"] == 2
+    assert ba["candidate_stroke_count"] == 1
+    assert ba["matched_stroke_count"] == 1
+    assert ba["score"] == 50.0
+    assert ba["penalties"]["missing_count"] == 1
+    assert ba["penalties"]["missing_stroke_indices"] == [1]
+    assert ba["penalties"]["extra_count"] == 0
+
+
+def test_confusions_score_is_min_of_directions(client):
+    # “乙”（1 笔横折）作参考时，“口”（2 笔）只算多笔、单笔代价也被
+    # 较少的笔画数摊薄，单向上被高估；反向（口为参考）对缺笔更严苛。
+    client.put("/v1/references/乙", json={"character": "乙", "strokes": REF_YI_ZHE})
+    client.put("/v1/references/口", json={"character": "口", "strokes": REF_KOU})
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 0}
+    ).json()
+    assert body["total_comparisons"] == 1
+    pair = body["pairs"][0]
+    s_ab = pair["a_to_b"]["score"]  # 乙 → 口：缺笔字作参考（被高估方向）
+    s_ba = pair["b_to_a"]["score"]  # 口 → 乙：更严苛方向
+    assert s_ab > s_ba
+    assert s_ab - s_ba > 1.0  # 两方向确实可分辨，非舍入噪声
+    # 字符对分数取较低值，避免缺笔字被单向高估
+    assert pair["score"] == min(s_ab, s_ba) == s_ba
+
+
+def test_confusions_threshold_filters_inclusive(client):
+    _register_confusion_fixtures(client)
+    # threshold=0 返回全部 3 对
+    assert client.get(
+        "/v1/references/confusions", params={"threshold": 0}
+    ).json()["total_hits"] == 3
+    # 闭区间：恰好 50.0 的“一-十”仍命中
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 50}
+    ).json()
+    assert body["total_hits"] == 1
+    assert [
+        (p["character_a"], p["character_b"]) for p in body["pairs"]
+    ] == [("一", "十")]
+    # 51 起无命中
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 51}
+    ).json()
+    assert body["total_hits"] == 0
+    assert body["pairs"] == []
+
+
+def test_confusions_threshold_100_only_identical_glyphs(client):
+    _register_confusion_fixtures(client)
+    # “丁”“乙”注册为“十”的完全同轨迹副本 → 三对 100 分
+    client.put("/v1/references/丁",
+               json={"character": "丁", "strokes": REF_SHI, "source": "dup"})
+    client.put("/v1/references/乙",
+               json={"character": "乙", "strokes": REF_SHI, "source": "dup"})
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 100}
+    ).json()
+    assert body["total_references"] == 5
+    assert body["total_comparisons"] == 10
+    assert body["total_hits"] == 3
+    # 同分按字符对字典序：码序 丁(U+4E01) < 乙(U+4E59) < 十(U+5341)
+    assert [
+        (p["character_a"], p["character_b"]) for p in body["pairs"]
+    ] == [("丁", "乙"), ("丁", "十"), ("乙", "十")]
+    assert all(p["score"] == 100.0 for p in body["pairs"])
+
+
+def test_confusions_limit_truncates_after_sorting(client):
+    _register_confusion_fixtures(client)
+    client.put("/v1/references/丁",
+               json={"character": "丁", "strokes": REF_SHI, "source": "dup"})
+    client.put("/v1/references/乙",
+               json={"character": "乙", "strokes": REF_SHI, "source": "dup"})
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 0, "limit": 2}
+    ).json()
+    # total_hits 是排序+截断前的命中总数
+    assert body["total_hits"] == 10
+    assert body["limit"] == 2
+    assert len(body["pairs"]) == 2
+    assert [
+        (p["character_a"], p["character_b"]) for p in body["pairs"]
+    ] == [("丁", "乙"), ("丁", "十")]  # 字典序最靠前的两个满分对
+
+
+def test_confusions_pair_is_unordered(client):
+    # 同一库内结果与字符注册顺序无关；字符对总以字典序较小者为 a
+    _register_confusion_fixtures(client)
+    names = [
+        (p["character_a"], p["character_b"])
+        for p in client.get("/v1/references/confusions").json()["pairs"]
+    ]
+    assert all(a < b for a, b in names)
+
+
+def test_confusions_stable_across_calls(client):
+    _register_confusion_fixtures(client)
+    client.put("/v1/references/丁",
+               json={"character": "丁", "strokes": REF_SHI, "source": "dup"})
+    r1 = client.get("/v1/references/confusions", params={"threshold": 0})
+    r2 = client.get("/v1/references/confusions", params={"threshold": 0})
+    assert r1.json()["pairs"] == r2.json()["pairs"]
+
+
+def test_confusions_param_validation(client):
+    _register_confusion_fixtures(client)
+    assert client.get(
+        "/v1/references/confusions", params={"threshold": -0.1}
+    ).status_code == 422
+    assert client.get(
+        "/v1/references/confusions", params={"threshold": 100.01}
+    ).status_code == 422
+    assert client.get(
+        "/v1/references/confusions", params={"limit": 0}
+    ).status_code == 422
+    assert client.get(
+        "/v1/references/confusions", params={"limit": 1001}
+    ).status_code == 422
+
+
+def test_compare_reference_pair_canonicalizes_order():
+    from app.recognition import compare_reference_pair
+
+    forward = compare_reference_pair("一", REF_YI, "十", REF_SHI)
+    reverse = compare_reference_pair("十", REF_SHI, "一", REF_YI)
+    # 无论参数次序如何，字符对都归范为字典序；视图方向随之固定
+    assert forward["character_a"] == "一" and forward["character_b"] == "十"
+    assert reverse["character_a"] == "一" and reverse["character_b"] == "十"
+    assert forward["score"] == reverse["score"]
+    assert forward["a_to_b"]["source_character"] == "一"
+    assert reverse["a_to_b"]["source_character"] == "一"
+
+
+def test_compare_reference_pair_rejects_same_character():
+    from app.recognition import compare_reference_pair
+
+    with pytest.raises(ValueError):
+        compare_reference_pair("十", REF_SHI, "十", REF_SHI)
+
+
 # ------------------------------------------------------------------ 练习质量趋势
 
 def _seed_submission(client, submission_id, character, score, passed,

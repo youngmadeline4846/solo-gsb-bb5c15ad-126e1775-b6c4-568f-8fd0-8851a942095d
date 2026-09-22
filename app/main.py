@@ -12,6 +12,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from . import __version__, analytics, db as db_module
 from .config import settings
 from .models import (
+    ConfusionAuditResponse,
+    ConfusionPair,
     PracticeAnalyticsResponse,
     RecognitionCandidate,
     RecognizeRequest,
@@ -23,7 +25,7 @@ from .models import (
     ValidateRequest,
     ValidateResponse,
 )
-from .recognition import recognize_against
+from .recognition import compare_reference_pair, recognize_against
 from .validation import Tolerances as EngineTolerances
 from .validation import validate
 
@@ -98,6 +100,61 @@ def register_reference(
         body.source,
     )
     return record
+
+
+@app.get(
+    "/v1/references/confusions",
+    response_model=ConfusionAuditResponse,
+    tags=["references"],
+)
+def reference_confusions(
+    threshold: float = Query(
+        default=0.0, ge=0.0, le=100.0,
+        description="相似度阈值（0-100），仅返回双向相似度达到该值的字符对",
+    ),
+    limit: int = Query(
+        default=100, ge=1, le=1000,
+        description="返回字符对数上限，在排序完成后截断",
+    ),
+    db: db_module.Database = Depends(get_db),
+):
+    """参考字混淆审计：对库中不同字符的参考轨迹做两两无序匹配。
+
+    每对字符分别计算 A→B 与 B→A 两个方向的置信度（复用识别引擎的
+    全局一对一分配与缺笔/多笔惩罚），字符对相似度取两者的较低值，
+    避免少笔字（如“一”对“十”）在单向上被高估。仅保留相似度达到
+    threshold 的字符对，按相似度降序、同分按字符对字典序稳定排列后
+    用 limit 截断。空库或只有一个参考字时返回空列表。
+    """
+    references = sorted(db.list_references(), key=lambda r: r["character"])
+    total_comparisons = len(references) * (len(references) - 1) // 2
+
+    pairs: list[ConfusionPair] = []
+    for i in range(len(references)):
+        for j in range(i + 1, len(references)):
+            ra, rb = references[i], references[j]
+            result = compare_reference_pair(
+                ra["character"],
+                [[tuple(p) for p in s] for s in ra["strokes"]],
+                rb["character"],
+                [[tuple(p) for p in s] for s in rb["strokes"]],
+            )
+            if result["score"] >= threshold:
+                pairs.append(ConfusionPair(**result))
+
+    # 相似度降序；同分按 (character_a, character_b) 字典序，保证稳定
+    pairs.sort(key=lambda p: (-p.score, p.character_a, p.character_b))
+    total_hits = len(pairs)
+    pairs = pairs[:limit]
+
+    return ConfusionAuditResponse(
+        threshold=threshold,
+        limit=limit,
+        total_references=len(references),
+        total_comparisons=total_comparisons,
+        total_hits=total_hits,
+        pairs=pairs,
+    )
 
 
 @app.get(
