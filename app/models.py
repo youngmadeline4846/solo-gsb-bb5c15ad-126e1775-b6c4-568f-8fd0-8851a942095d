@@ -208,6 +208,71 @@ class RecognizeResponse(BaseModel):
     )
 
 
+# ------------------------------------------------------------ 参考字混淆审计
+
+class ConfusionDirectionScore(BaseModel):
+    """单个匹配方向（from→to）的相似度与缺笔/多笔惩罚明细。"""
+
+    direction: str = Field(description="匹配方向，形如 “A→B”：A 作参考、B 作用户轨迹")
+    score: float = Field(
+        ge=0.0, le=100.0, description="该方向的相似度 0-100，越高越相似",
+    )
+    stroke_count: int = Field(description="被审计轨迹（→ 右侧字符）的笔画数")
+    matched_stroke_count: int
+    missing_count: int = Field(
+        description="缺笔数：参考笔（→ 左侧字符）中无对应匹配的数量",
+    )
+    extra_count: int = Field(
+        description="多笔数：被审计轨迹中无参考笔对应的数量",
+    )
+    missing_stroke_indices: list[int] = Field(description="未匹配的参考笔画下标")
+    extra_stroke_indices: list[int] = Field(description="未匹配的被审计笔画下标")
+    matched_cost_total: float = Field(description="已配对笔画的代价之和")
+    missing_penalty_total: float = Field(description="缺笔惩罚合计")
+    extra_penalty_total: float = Field(description="多笔惩罚合计")
+    total_cost: float = Field(
+        description="总代价 = 已配对代价 + 缺笔惩罚 + 多笔惩罚",
+    )
+
+
+class ConfusionPair(BaseModel):
+    """一对不同字符的参考轨迹在双向匹配下的混淆审计结果。"""
+
+    characters: list[str] = Field(
+        min_length=2, max_length=2,
+        description="字符对，按字典序升序排列（无序对）",
+    )
+    score: float = Field(
+        ge=0.0, le=100.0,
+        description="聚合相似度 = min(A→B, B→A)，取双向较低值，0-100",
+    )
+    forward: ConfusionDirectionScore = Field(description="A→B 方向（小字符 → 大字符）")
+    backward: ConfusionDirectionScore = Field(description="B→A 方向（大字符 → 小字符）")
+
+
+class ConfusionAuditResponse(BaseModel):
+    """参考字库两两混淆审计结果。
+
+    score 取 A→B 与 B→A 两个方向相似度的较低值：缺笔字（笔画较少的字
+    被当作用户轨迹时）单方向可能只按笔数均摊扣缺笔分、分数虚高，双向取
+    低可避免其被单向高估。total_hits 为阈值命中总数（截断前），pairs
+    已按 limit 截断。
+    """
+
+    threshold: float = Field(ge=0.0, le=100.0, description="本次生效的相似度阈值")
+    limit: int = Field(ge=1, description="返回字符对数量上限（排序后截断）")
+    total_references: int = Field(description="参与审计的已注册参考字数量")
+    total_comparisons: int = Field(
+        description="两两无序比较总数 n·(n−1)/2",
+    )
+    total_hits: int = Field(
+        description="相似度达到阈值的字符对总数（limit 截断前）",
+    )
+    pairs: list[ConfusionPair] = Field(
+        description="按相似度降序的混淆对；同分按字符对字典序稳定排序",
+    )
+
+
 class SubmissionRecord(BaseModel):
     submission_id: str
     request_hash: str

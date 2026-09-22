@@ -8,6 +8,10 @@
 在全部已注册参考字中按置信度返回 top-k 候选，通过全局一对一最优分配容忍书写次序差异，
 并把缺笔/多笔作为显式惩罚纳入总分。
 
+**参考字混淆审计**（`GET /v1/references/confusions`）：对库内不同字符的参考轨迹做
+两两无序匹配，双向（A→B 与 B→A）打分取较低值，返回相似度达到阈值的混淆字符对，
+便于发现“库中哪些参考字彼此过于相似、容易误识别”。
+
 **练习质量趋势**（`GET /v1/analytics/practice`）：按字符、时间闭区间与通过状态筛选
 已保存的校验提交，在单次一致性快照中返回提交数、通过率、平均分、P50/P90 分数、
 首个失败笔画分布与按 UTC 日期分桶的趋势。
@@ -44,6 +48,7 @@ pytest tests/ -q
 | `GET` | `/v1/config` | 查看服务端默认容差 |
 | `PUT` | `/v1/references/{character}` | 注册/更新某汉字的参考笔画序列 |
 | `GET` | `/v1/references/{character}` | 查询参考笔画 |
+| `GET` | `/v1/references/confusions` | 参考字混淆审计：两两无序双向匹配，返回达到阈值的易混字符对 |
 | `POST` | `/v1/recognize` | 候选字识别：未标注轨迹 → top-k 候选 |
 | `POST` | `/v1/validate` | 校验一次书写提交（幂等） |
 | `GET` | `/v1/submissions/{submission_id}` | 按幂等键查询历史结果 |
@@ -121,6 +126,92 @@ curl -X POST http://localhost:8000/v1/recognize \
 
 缺笔/多笔示例（只写一横去匹配“十”）：`matched_stroke_count=1`、
 `missing_count=1`、`missing_stroke_indices=[1]`、`score=50.0`。
+
+### 示例：参考字混淆审计
+
+对已注册参考字两两做无序双向匹配，筛出彼此过于相似的字符对：
+
+```bash
+# 注册若干参考字（“丁”与“十”轨迹完全相同，构成 100 分混淆对）
+curl -X PUT http://localhost:8000/v1/references/一 \
+  -H 'Content-Type: application/json' \
+  -d '{"character":"一","strokes":[[[100,200],[300,200]]]}'
+curl -X PUT http://localhost:8000/v1/references/十 \
+  -H 'Content-Type: application/json' \
+  -d '{"character":"十","strokes":[[[100,200],[300,200]],[[200,100],[200,300]]]}'
+curl -X PUT http://localhost:8000/v1/references/丁 \
+  -H 'Content-Type: application/json' \
+  -d '{"character":"丁","strokes":[[[100,200],[300,200]],[[200,100],[200,300]]]}'
+
+# 只返回相似度 ≥ 80 的字符对，最多 100 对
+curl "http://localhost:8000/v1/references/confusions?threshold=80&limit=100"
+```
+
+查询参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `threshold` | `80.0` | 聚合相似度阈值 `0..100`，仅返回达到该值的字符对；越界返回 `422` |
+| `limit` | `100` | 返回字符对数量上限（`1..1000`），在**排序之后**截断 |
+
+响应：
+
+```json
+{
+  "threshold": 80.0,
+  "limit": 100,
+  "total_references": 3,
+  "total_comparisons": 3,
+  "total_hits": 1,
+  "pairs": [
+    {
+      "characters": ["丁", "十"],
+      "score": 100.0,
+      "forward": {
+        "direction": "丁→十",
+        "score": 100.0,
+        "stroke_count": 2,
+        "matched_stroke_count": 2,
+        "missing_count": 0,
+        "extra_count": 0,
+        "missing_stroke_indices": [],
+        "extra_stroke_indices": [],
+        "matched_cost_total": 0.0,
+        "missing_penalty_total": 0.0,
+        "extra_penalty_total": 0.0,
+        "total_cost": 0.0
+      },
+      "backward": {
+        "direction": "十→丁",
+        "score": 100.0,
+        "stroke_count": 2,
+        "matched_stroke_count": 2,
+        "missing_count": 0,
+        "extra_count": 0,
+        "missing_stroke_indices": [],
+        "extra_stroke_indices": [],
+        "matched_cost_total": 0.0,
+        "missing_penalty_total": 0.0,
+        "extra_penalty_total": 0.0,
+        "total_cost": 0.0
+      }
+    }
+  ]
+}
+```
+
+- `total_comparisons = n·(n−1)/2` 为两两无序比较总数，`total_hits` 为达到阈值的
+  字符对总数（**截断前**），`pairs` 长度不超过 `limit`；
+- 字符对按字典序规范化（小者在前），`pairs` 按 `score` 降序、字符对字典序升序
+  **稳定排列**，重复请求顺序一致；
+- `score` 同时计算 **A→B**（A 作参考、B 作用户轨迹）与 **B→A** 两个方向并取
+  **较低值**：笔画较少的字被当作用户轨迹时，长字多出的笔只按笔数均摊扣分，
+  单方向分数可能虚高，双向取低可避免**缺笔字被单向高估**；
+- 每个方向给出该方向的分数与缺笔/多笔明细——`forward`（字典序小字 → 大字）
+  中 `extra_*` 描述大字相对小字多写的笔，`backward` 中 `missing_*` 描述大字
+  作参考时小字缺写的笔，下标均指向该方向参考/被审计轨迹的笔画下标；
+- **空库或仅一个参考字**时 `total_comparisons`、`total_hits` 均为 `0`，
+  `pairs` 为空列表。
 
 ### 示例：校验“十”字
 
@@ -276,6 +367,26 @@ curl "http://localhost:8000/v1/analytics/practice?character=十&start=2026-09-20
 6. **排序**：所有参考字按分数降序取 `top_k`；**相同分数按字符升序稳定排序**，
    每个候选都返回笔画对应关系（含各项指标）与缺笔/多笔惩罚明细。
 
+### 参考字混淆审计算法（`/v1/references/confusions`）
+
+审计不涉及用户轨迹，直接对**库内参考字**两两比较：
+
+1. **无序对枚举**：参考字按字符字典序排列，枚举全部 n·(n−1)/2 个无序对
+   （字符对规范化为字典序，不重复比较）。
+2. **复用识别引擎双向打分**：对字符对 (A, B) 各调用一次识别引擎——
+   **A→B** 以 A 的外接框归一化（A 作参考、B 作用户轨迹），
+   **B→A** 以 B 的外接框归一化（B 作参考、A 作用户轨迹）；
+   两个方向都走代价矩阵 + 匈牙利全局一对一最优分配，并各自输出缺笔/多笔
+   计数、下标与惩罚合计（同 `/v1/recognize` 的 `penalties`）。
+3. **双向取低**：聚合相似度 `score = min(score_A→B, score_B→A)`。
+   缺笔/多笔按 `max(两笔数)` 归一，短字当用户轨迹时长字多出的笔被均摊，
+   单方向可能给出虚高分数；取双向较低值保证缺笔字不会被单向高估。
+4. **阈值过滤**：仅保留 `score ≥ threshold` 的字符对；
+   `total_hits` 统计截断前的命中总数。
+5. **排序与截断**：按 `score` 降序、字符对字典序（先第一字符再第二字符）
+   升序稳定排列，`limit` 在排序之后截断。空库或只有一个参考字时直接返回
+   空列表，不做任何比对。
+
 ### 分叉/转折笔画容差
 
 折、钩类复合笔画（如“┐”）在拐点处书写误差天然更大。引擎先在参考笔画上检测拐点
@@ -325,14 +436,15 @@ curl "http://localhost:8000/v1/analytics/practice?character=十&start=2026-09-20
 
 ```
 app/
-├── main.py        # FastAPI 应用与路由（识别 + 幂等校验 + 练习趋势）
+├── main.py        # FastAPI 应用与路由（识别 + 混淆审计 + 幂等校验 + 练习趋势）
 ├── models.py      # Pydantic 请求/响应模型
 ├── recognition.py # 候选字识别引擎（代价矩阵 + 匈牙利全局一对一分配 + 缺/多笔惩罚）
+├── confusions.py  # 参考字混淆审计引擎（两两无序匹配 + 双向取低 + 阈值/排序/截断）
 ├── validation.py  # 笔顺匹配引擎（方向/起止点/形状/错序/计分）
 ├── analytics.py   # 练习质量趋势统计（线性插值分位数 + UTC 日期分桶）
 ├── geometry.py    # 归一化、重采样、拐点检测
 ├── db.py          # SQLite 持久化（参考字 + 幂等提交 + 一致性快照查询）
 └── config.py      # 环境变量配置
-tests/test_api.py  # 39 个端到端用例
+tests/test_api.py  # 端到端用例（含混淆审计）
 Dockerfile / docker-compose.yml
 ```

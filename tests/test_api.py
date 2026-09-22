@@ -615,3 +615,201 @@ def test_percentile_linear_interpolation():
     assert percentile(values, 1.0) == 40.0
     assert percentile([42.0], 0.5) == 42.0
     assert percentile([42.0], 0.9) == 42.0
+
+
+# ------------------------------------------------------------------ 参考字混淆审计
+
+# “丁”：与“十”参考轨迹完全一致（用于制造 100 分混淆对）
+REF_DING = REF_SHI
+
+
+def _register_confusion_fixtures(client, with_duplicate=False):
+    client.put("/v1/references/一", json={"character": "一", "strokes": REF_YI})
+    client.put("/v1/references/二", json={"character": "二", "strokes": REF_ER})
+    client.put("/v1/references/十", json={"character": "十", "strokes": REF_SHI})
+    if with_duplicate:
+        client.put("/v1/references/丁", json={"character": "丁", "strokes": REF_DING})
+
+
+def test_confusions_empty_library(client):
+    r = client.get("/v1/references/confusions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_references"] == 0
+    assert body["total_comparisons"] == 0
+    assert body["total_hits"] == 0
+    assert body["pairs"] == []
+    assert body["threshold"] == 80.0
+    assert body["limit"] == 100
+
+
+def test_confusions_single_reference(client):
+    # 库内只有一个参考字时没有可比较的字符对
+    client.put("/v1/references/一", json={"character": "一", "strokes": REF_YI})
+    body = client.get("/v1/references/confusions").json()
+    assert body["total_references"] == 1
+    assert body["total_comparisons"] == 0
+    assert body["total_hits"] == 0
+    assert body["pairs"] == []
+
+
+def test_confusions_default_threshold_no_false_hits(client):
+    _register_confusion_fixtures(client)
+    body = client.get("/v1/references/confusions").json()
+    # 一/二/十 两两最高仅 50 分，默认阈值 80 下无命中
+    assert body["total_references"] == 3
+    assert body["total_comparisons"] == 3
+    assert body["total_hits"] == 0
+    assert body["pairs"] == []
+
+
+def test_confusions_duplicate_glyph_pair_hits_100(client):
+    _register_confusion_fixtures(client, with_duplicate=True)
+    body = client.get("/v1/references/confusions").json()
+    assert body["total_references"] == 4
+    assert body["total_comparisons"] == 6  # 4*3/2
+    assert body["total_hits"] == 1
+    pair = body["pairs"][0]
+    assert pair["characters"] == ["丁", "十"]  # 字典序，无序对
+    assert pair["score"] == 100.0
+    for d in (pair["forward"], pair["backward"]):
+        assert d["score"] == 100.0
+        assert d["missing_count"] == 0
+        assert d["extra_count"] == 0
+        assert d["matched_cost_total"] == 0.0
+        assert d["total_cost"] == 0.0
+    assert pair["forward"]["direction"] == "丁→十"
+    assert pair["backward"]["direction"] == "十→丁"
+
+
+def test_confusions_threshold_filter_and_stable_order(client):
+    _register_confusion_fixtures(client, with_duplicate=True)
+    # 阈值 20：全部 6 对都达到（100 / 50 / 50 / 25.4 / 25.4 / 25.4）
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 20.0}
+    ).json()
+    assert body["total_hits"] == 6
+    assert len(body["pairs"]) == 6
+    # 相似度降序；同分按字符对字典序升序
+    ordered = [
+        (["丁", "十"], 100.0),
+        (["一", "丁"], 50.0),
+        (["一", "十"], 50.0),
+        (["一", "二"], 25.4),
+        (["丁", "二"], 25.4),
+        (["二", "十"], 25.4),
+    ]
+    assert [(p["characters"], p["score"]) for p in body["pairs"]] == ordered
+    # 阈值抬到 30：只剩 100 与两个 50 分对
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 30.0}
+    ).json()
+    assert body["total_hits"] == 3
+    assert [p["characters"] for p in body["pairs"]] == [
+        ["丁", "十"], ["一", "丁"], ["一", "十"],
+    ]
+    # 重复请求顺序一致
+    again = client.get(
+        "/v1/references/confusions", params={"threshold": 30.0}
+    ).json()
+    assert [p["characters"] for p in again["pairs"]] == [
+        p["characters"] for p in body["pairs"]
+    ]
+
+
+def test_confusions_limit_truncates_after_sort(client):
+    _register_confusion_fixtures(client, with_duplicate=True)
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 0.0, "limit": 2}
+    ).json()
+    # total_hits 是截断前的命中总数，pairs 按 limit 截断且保持排序
+    assert body["total_hits"] == 6
+    assert body["limit"] == 2
+    assert len(body["pairs"]) == 2
+    assert [p["characters"] for p in body["pairs"]] == [
+        ["丁", "十"], ["一", "丁"],
+    ]
+
+
+def test_confusions_bidirectional_missing_extra_penalties(client):
+    _register_confusion_fixtures(client)
+    body = client.get(
+        "/v1/references/confusions", params={"threshold": 50.0}
+    ).json()
+    # 唯一命中：一/十（一 1 笔，十 2 笔，横完全重合）
+    pair = body["pairs"][0]
+    assert pair["characters"] == ["一", "十"]
+    assert pair["score"] == 50.0
+    forward, backward = pair["forward"], pair["backward"]
+    # 一→十：以一为参考，十多出一竖 → 多笔 1，无缺笔
+    assert forward["direction"] == "一→十"
+    assert forward["score"] == 50.0
+    assert forward["stroke_count"] == 2
+    assert forward["missing_count"] == 0
+    assert forward["extra_count"] == 1
+    assert forward["extra_stroke_indices"] == [1]
+    assert forward["missing_penalty_total"] == 0.0
+    assert forward["extra_penalty_total"] == 1.0
+    # 十→一：以十为参考，一只写了横 → 缺笔 1（竖，下标 1），无多笔
+    assert backward["direction"] == "十→一"
+    assert backward["score"] == 50.0
+    assert backward["stroke_count"] == 1
+    assert backward["missing_count"] == 1
+    assert backward["extra_count"] == 0
+    assert backward["missing_stroke_indices"] == [1]
+    assert backward["missing_penalty_total"] == 1.0
+    assert backward["extra_penalty_total"] == 0.0
+
+
+def test_confusions_route_not_shadowed_by_character_route(client):
+    _register_confusion_fixtures(client)
+    # 静态路径优先：confusions 不被 /v1/references/{character} 吞掉
+    assert client.get("/v1/references/confusions").status_code == 200
+    # 普通取参考字接口仍正常
+    got = client.get("/v1/references/十")
+    assert got.status_code == 200
+    assert got.json()["stroke_count"] == 2
+
+
+def test_confusions_param_validation(client):
+    _register_confusion_fixtures(client)
+    base = "/v1/references/confusions"
+    assert client.get(base, params={"threshold": -0.01}).status_code == 422
+    assert client.get(base, params={"threshold": 100.01}).status_code == 422
+    assert client.get(base, params={"limit": 0}).status_code == 422
+    assert client.get(base, params={"limit": -1}).status_code == 422
+    assert client.get(base, params={"limit": 1.5}).status_code == 422
+    # 边界值合法
+    assert client.get(base, params={"threshold": 0.0}).status_code == 200
+    assert client.get(base, params={"threshold": 100.0}).status_code == 200
+    assert client.get(base, params={"limit": 1}).status_code == 200
+
+
+def test_confusions_similarity_is_min_of_both_directions(monkeypatch):
+    """缺笔/多笔惩罚不对称时，聚合相似度取双向较低值。
+
+    多笔惩罚调小（0.2）、缺笔惩罚保持 1.0：一笔字当用户轨迹（缺笔）
+    只得 50 分，而反向（二笔字当用户、多一笔）虚高到 90 分；取 min
+    可避免缺笔字被单向高估。
+    """
+    import dataclasses
+    import app.recognition as rec
+
+    custom = dataclasses.replace(
+        rec.settings,
+        recognize_missing_penalty=1.0,
+        recognize_extra_penalty=0.2,
+    )
+    monkeypatch.setattr(rec, "settings", custom)
+
+    from app.confusions import compare_characters
+
+    one = [[(100.0, 200.0), (300.0, 200.0)]]
+    two = [
+        [(100.0, 200.0), (300.0, 200.0)],
+        [(200.0, 100.0), (200.0, 300.0)],
+    ]
+    result = compare_characters("一", one, "十", two)
+    assert result["forward"]["score"] == 90.0   # 一→十：多笔便宜（0.2/2）
+    assert result["backward"]["score"] == 50.0  # 十→一：缺笔重罚（1.0/2）
+    assert result["score"] == 50.0

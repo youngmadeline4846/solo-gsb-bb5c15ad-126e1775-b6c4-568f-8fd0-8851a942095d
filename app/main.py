@@ -10,8 +10,12 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from . import __version__, analytics, db as db_module
+from .confusions import audit_confusions
 from .config import settings
 from .models import (
+    ConfusionAuditResponse,
+    ConfusionDirectionScore,
+    ConfusionPair,
     PracticeAnalyticsResponse,
     RecognitionCandidate,
     RecognizeRequest,
@@ -98,6 +102,51 @@ def register_reference(
         body.source,
     )
     return record
+
+
+@app.get(
+    "/v1/references/confusions",
+    response_model=ConfusionAuditResponse,
+    tags=["references"],
+)
+def reference_confusions(
+    threshold: float = Query(
+        default=80.0, ge=0.0, le=100.0,
+        description="聚合相似度阈值（0-100），仅返回达到该值的字符对",
+    ),
+    limit: int = Query(
+        default=100, ge=1, le=1000,
+        description="返回字符对数量上限，在排序之后截断",
+    ),
+    db: db_module.Database = Depends(get_db),
+):
+    """参考字混淆审计：对库内不同字符的参考轨迹做两两无序匹配。
+
+    对每一对字符分别以各自为归一化基准跑全局一对一最优分配，相似度
+    **同时计算 A→B 与 B→A 并取较低值**，避免缺笔字在单向匹配下被
+    高估。仅返回聚合相似度达到 ``threshold`` 的字符对，按相似度降序、
+    字符对字典序升序稳定排列，``limit`` 在排序之后截断；每个方向都
+    返回缺笔/多笔计数、下标与惩罚合计。空库或仅有一个参考字时比较
+    总数为 0、``pairs`` 为空列表。
+    """
+    references = db.list_references()
+    result = audit_confusions(references, threshold=threshold, limit=limit)
+    return ConfusionAuditResponse(
+        threshold=result["threshold"],
+        limit=result["limit"],
+        total_references=result["total_references"],
+        total_comparisons=result["total_comparisons"],
+        total_hits=result["total_hits"],
+        pairs=[
+            ConfusionPair(
+                characters=p["characters"],
+                score=p["score"],
+                forward=ConfusionDirectionScore(**p["forward"]),
+                backward=ConfusionDirectionScore(**p["backward"]),
+            )
+            for p in result["pairs"]
+        ],
+    )
 
 
 @app.get(
