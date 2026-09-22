@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/app.db
+      # 默认容差（可被请求体 tolerances 覆盖）
+      TOL_START_END: "0.15"
+      TOL_DIRECTION_DEG: "35"
+      TOL_SHAPE: "0.18"
+      TOL_FORK_EXTRA_DEG: "20"
+      TOL_FORK_EXTRA_SHAPE: "0.08"
+      CORNER_ANGLE_DEG: "50"
+      RESAMPLE_POINTS: "32"
+      # 候选字识别：缺笔/多笔的单笔代价（0..1）
+      RECOG_MISSING_PENALTY: "1.0"
+      RECOG_EXTRA_PENALTY: "1.0"
+    volumes:
+      - stroke-data:/data
+    restart: unless-stopped
+
+volumes:
+  stroke-data:
